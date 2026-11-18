@@ -1,0 +1,60 @@
+package require tcltest
+package require pure-tcl-oauth2-server
+namespace import ::tcltest::test
+proc server_clock {} {return 1000}
+proc new_server {backend} {
+    set server [::oauth2::server::create -issuer https://issuer.example -store $backend -clock server_clock]
+    $server register_client app -redirect_uris {https://app.example/callback} -scope {read write} -audiences resource
+    $server register_client api -auth_method client_secret_basic -secret [string repeat x 32] -scope read -audiences resource -introspection true -grants client_credentials
+    return $server
+}
+proc code_fields {server} {
+    set pkce [::oauth2::core::pkce]
+    set request [$server authorize_validate [dict create client_id app redirect_uri https://app.example/callback response_type code scope read code_challenge [dict get $pkce code_challenge] code_challenge_method S256]]
+    set result [$server authorize_complete [dict get $request request_id] user]
+    set query [::oauth2::core::form_decode [lindex [split [dict get $result headers Location] ?] 1]]
+    dict create client_id app grant_type authorization_code redirect_uri https://app.example/callback code [dict get $query code] code_verifier [dict get $pkce code_verifier]
+}
+foreach backend {memory sql} {
+    if {$backend eq "sql"} {
+        package require tpersist
+        set db [::tpersist::db_connect -database :memory: -autobegin 0]
+        ::oauth2::store::initdb $db
+        set store [::oauth2::store::sql $db server]
+    } else {set store [::oauth2::store::memory]}
+    set server [new_server $store]
+    test server-$backend-code {PKCE, redirect binding and code replay revocation} -body {
+        set fields [code_fields $server]
+        set wrong $fields; dict set wrong redirect_uri https://evil.example/callback
+        set results [list [catch {$server token $wrong}]]
+        set wrong $fields; dict set wrong code_verifier [string repeat a 43]
+        lappend results [catch {$server token $wrong}]
+        set tokens [$server token $fields]
+        set access [::oauth2::core::claim_string $tokens access_token]
+        lappend results [dict get [$server resource $access resource read] subject]
+        lappend results [catch {$server token $fields}]
+        lappend results [catch {$server resource $access resource read}]
+        set results
+    } -result {1 1 user 1 1}
+    test server-$backend-refresh {refresh rotates, and reuse commits family revocation} -body {
+        set tokens [$server token [code_fields $server]]
+        set fields [dict create client_id app grant_type refresh_token refresh_token [::oauth2::core::claim_string $tokens refresh_token]]
+        set next [$server token $fields]
+        set access [::oauth2::core::claim_string $next access_token]
+        list [expr {[dict get $tokens refresh_token] ne [dict get $next refresh_token]}] \
+            [catch {$server resource $access wrong read}] [catch {$server resource $access resource write}] \
+            [catch {$server token $fields}] [catch {$server resource $access resource read}]
+    } -result {1 1 1 1 1}
+    test server-$backend-credentials {client authentication and explicit introspection policy} -body {
+        set auth "Basic [binary encode base64 -maxlen 0 api:[string repeat x 32]]"
+        set tokens [$server token {grant_type client_credentials} $auth]
+        set access [::oauth2::core::claim_string $tokens access_token]
+        set active [$server introspect [dict create token $access] $auth]
+        $server revoke [dict create token $access] $auth
+        list [dict get $active active] [dict get [$server introspect [dict create token $access] $auth] active] \
+            [catch {$server token {grant_type client_credentials client_id api client_secret wrong}}] \
+            [catch {$server introspect [dict create token $access client_id app]}]
+    } -result {{BOOL 1} {BOOL 0} 1 1}
+    $server destroy; $store destroy
+    if {$backend eq "sql"} {::tpersist::db_disconnect $db}
+}
